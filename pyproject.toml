@@ -6,7 +6,15 @@ authors = ["taejunsong <songtj10@snu.ac.kr>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.11"
+python = ">=3.11,<3.13"
+nltk = "^3.9.1"
+transformers = "^4.49.0"
+sentencepiece = "^0.2.0"
+spacy = "^3.8.4"
+numpy = "^2.2.3"
+scikit-learn = "^1.6.1"
+torch = "2.2.2"
+torchtext = "0.17.2"
 
 
 [build-system]
