@@ -23,10 +23,12 @@ os.environ["LANGSMITH_API_KEY"] = config('LANGSMITH_API_KEY')
 st.set_page_config(page_title="LLM-REALTOR")
 
 if 'conversation' not in st.session_state:
-
+    memory = ConversationBufferMemory()
     st.session_state.conversation = ConversationChain(
-        llm=ChatOllama(model="llama3.2",temperature=0)
+        llm=ChatOllama(model="llama3.2",temperature=0),
+        memory=memory
     )
+
 st.title("💬 LLM REALTOR")
 
 user_input = st.chat_input("Ask me anything!")
