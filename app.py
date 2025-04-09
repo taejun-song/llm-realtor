@@ -6,10 +6,11 @@ import asyncio
 
 import streamlit as st
 from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_core.documents import Document
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.runnables import Runnable
+from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_community.tools import DuckDuckGoSearchResults
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import StateGraph
@@ -34,7 +35,8 @@ class PipelineState(TypedDict):
     websites: List[str]
     context: List[Document]
     top_docs: List[Document]
-    answer: str
+    messages: str
+    output: str
 
 # ------------------------------------------------------------------------------
 # Agent: Query Refiner
@@ -149,7 +151,7 @@ def generator_node(state: PipelineState) -> PipelineState:
         }
     ]
     response = llm.invoke(messages)
-    state["answer"] = response.content
+    state["output"] = response.content
     return state
 
 # ------------------------------------------------------------------------------
@@ -172,14 +174,20 @@ graph.set_finish_point("generator")
 
 agentic_rag_pipeline = graph.compile()
 
+def get_session_history(session_id: str):
+    return InMemoryChatMessageHistory()
+
+# Wrap just the `llm` or entire pipeline if you want history across pipeline
+chat_with_history: Runnable = RunnableWithMessageHistory(
+    agentic_rag_pipeline,
+    get_session_history,
+    input_messages_key="query",  # This is what the user types
+    history_messages_key="messages",  # This needs to be passed if you want history
+)
+
+
 st.set_page_config(page_title="LLM-REALTOR")
 
-if 'conversation' not in st.session_state:
-    memory = ConversationBufferMemory()
-    st.session_state.conversation = ConversationChain(
-        llm=llm,
-        memory=memory
-    )
 
 st.title("🏠 LLM REALTOR")
 
@@ -198,8 +206,14 @@ if user_input:
     with st.chat_message("user"):
         st.markdown(user_input)
     websites=["apartments.com","realtor.com"]
-    graph_input = {"query": user_input, "websites":websites}
-    response = agentic_rag_pipeline.invoke(graph_input)['answer']
+    graph_input = {
+        "query": user_input,
+        "websites": websites,
+        "messages": st.session_state['messages']  # optional, if you want full chat context
+    }
+    response = chat_with_history.invoke(graph_input, config={"configurable": {"session_id": "my_unique_user_id"}})['output']
+
+
 
     with st.chat_message("assistant"):
         st.markdown(response)
