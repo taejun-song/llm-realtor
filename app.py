@@ -2,6 +2,7 @@ import os
 from decouple import Config, RepositoryEnv
 from pathlib import Path
 from typing_extensions import List, TypedDict
+import asyncio
 
 import streamlit as st
 from langchain_ollama import ChatOllama, OllamaEmbeddings
@@ -28,28 +29,37 @@ llm = ChatOllama(model="llama3.2",temperature=0)
 embeddings = OllamaEmbeddings(model="llama3.2")
 vector_store = InMemoryVectorStore(embeddings)
 
-# State Typing
 class PipelineState(TypedDict):
     query: str
     websites: List[str]
     context: List[Document]
+    top_docs: List[Document]
     answer: str
 
 # ------------------------------------------------------------------------------
-# DuckDuckGO Loader
+# Agent: Query Refiner
 # ------------------------------------------------------------------------------
+def query_refiner_node(state: PipelineState) -> PipelineState:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You rewrite vague or incomplete real estate queries into short, specific search queries. "
+                "Output ONLY the improved query, no explanation. "
+                "Keep it under 20 words. Focus on keywords useful for search engines like location, bedroom count, price, and amenities."
+            )
+        },
+        {"role": "user", "content": f"Original query: {state['query']}"}
+    ]
+    refined = llm.invoke(messages)
+    state["query"] = refined.content.strip().strip('"')
+    return state
 
+
+# ------------------------------------------------------------------------------
+# Search + Embed Node
+# ------------------------------------------------------------------------------
 def duckduckgo_docs(query: str, websites: List[str]) -> List[Document]:
-    """
-    Search DuckDuckGo for a query restricted to specific websites.
-
-    Args:
-        query (str): The search query string.
-        websites (List[str]): A list of website domains to search within.
-
-    Returns:
-        List[Document]: A list of LangChain Document objects created from search result snippets.
-    """
     search = DuckDuckGoSearchResults(output_format="list")
     results = [
         item
@@ -64,19 +74,7 @@ def duckduckgo_docs(query: str, websites: List[str]) -> List[Document]:
         for entry in results
     ]
 
-
 def duckduckgo_loader_node(state: PipelineState) -> PipelineState:
-    """
-    Load DuckDuckGo search results into a vector store after chunking text.
-
-    Args:
-        state (PipelineState): A pipeline state dictionary containing:
-            - 'query': str, the search query.
-            - 'websites': List[str], the domains to search.
-
-    Returns:
-        PipelineState: The updated pipeline state.
-    """
     docs = duckduckgo_docs(state['query'], state['websites'])
 
     text_splitter = RecursiveCharacterTextSplitter(
@@ -84,38 +82,69 @@ def duckduckgo_loader_node(state: PipelineState) -> PipelineState:
         chunk_overlap=20
     )
     all_splits = text_splitter.split_documents(docs)
-
     vector_store.add_documents(documents=all_splits)
-
     return state
 
-def retriever_node(state: PipelineState):
-    # Placeholder for actual retrieval logic
+# ------------------------------------------------------------------------------
+# Retriever Node
+# ------------------------------------------------------------------------------
+def retriever_node(state: PipelineState) -> PipelineState:
     state["context"] = vector_store.similarity_search(state["query"])
     return state
 
-def generator_node(state: PipelineState):
-    # Placeholder for actual generation logic
-    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+# ------------------------------------------------------------------------------
+# Ranking Agent
+# ------------------------------------------------------------------------------
+def ranking_agent_node(state: PipelineState) -> PipelineState:
+    context = state["context"]
+    query = state["query"]
+
+    doc_list = "\n\n".join(
+        f"[{i}] {doc.page_content}\nURL: {doc.metadata.get('source', '')}"
+        for i, doc in enumerate(context)
+    )
+
+    messages = [
+        {"role": "system", "content": "You are a real estate ranking assistant. Rank the following listings by relevance to the query."},
+        {"role": "user", "content": f"Query: {query}\n\n{doc_list}\n\nSelect the top 3 most relevant listings."}
+    ]
+    response = llm.invoke(messages)
+
+    # Basic: Just take the top 3 documents
+    state["top_docs"] = context[:3]
+    return state
+
+# ------------------------------------------------------------------------------
+# Generator Node
+# ------------------------------------------------------------------------------
+def generator_node(state: PipelineState) -> PipelineState:
+    docs_content = "\n\n".join(
+        f"{doc.page_content}\n[Source]({doc.metadata.get('source', '')})"
+        for doc in state["top_docs"]
+    )
     messages = [
         {
-            "role": "system",
-            "content": (
-                "You are a highly confident, precise real estate recommendation engine. "
-                "Based solely on the provided crawled context, you must select one specific condo listing that best meets the search criteria. "
-                "Even if some details are missing, combine the available information to provide a clear, detailed recommendation. "
-                "Do NOT state that you cannot recommend or express uncertainty. "
-                "Always output a recommendation that includes the exact address, unit type, and amenities as they appear in the context. "
-                "If a particular detail is not mentioned, simply omit it—do not add or hallucinate any information."
-            )
+        "role": "system",
+        "content": (
+            "You are a precise and strict real estate recommendation engine. "
+            "You must select **only one** apartment listing that matches the user’s search query **exactly** and use information strictly from the provided crawled context. "
+            "You are not allowed to guess, infer, or assume anything. "
+            "Only recommend listings that meet all parts of the user's query as explicitly stated in the context. "
+            "Do NOT relax the match. For example, if the query asks for '2 bed, 2 bath', you must find a listing that explicitly includes both '2 bed' and '2 bath' in the same description. "
+            "Do not recommend listings that say '1 bath' or are missing any required detail. "
+            "Do NOT state assumptions like 'likely a typo' or make excuses for mismatched data. "
+            "The output must include exactly and only what's in the crawled context: apartment name, address, unit type (must match), and the listing URL (must come from the same listing block). "
+            "Never invent or adjust any details. Omit any field that is not present. Do not hallucinate or rationalize missing or conflicting data."
+        )
         },
-        {
-            "role": "user",
-            "content": (
-                "Below is the crawled context from apartments.com:\n\n"
-                f"{docs_content}\n\n"
-                "Based solely on this data, please provide a detailed recommendation for one specific condo listing that meets the search criteria. "
-                "Include all available details (e.g. address, unit type, and amenities) exactly as found in the context."
+    {
+        "role": "user",
+        "content": (
+            f"{state['query']}\n\n"
+            "Below is the crawled context from apartments.com:\n\n"
+            f"{docs_content}\n\n"
+            "Based **only** on this context, recommend **one** specific apartment listing that matches the query **exactly** (2 bed, 2 bath, located in LA, CA). "
+            "Include only the following fields, exactly as found in the same listing: Apartment Name, Address, Apartment Unit Type, Amenities (if any), and URL Link."
             )
         }
     ]
@@ -123,22 +152,25 @@ def generator_node(state: PipelineState):
     state["answer"] = response.content
     return state
 
-
-
-# Graph definition
+# ------------------------------------------------------------------------------
+# LangGraph Setup
+# ------------------------------------------------------------------------------
 graph = StateGraph(PipelineState)
+
+graph.add_node("query_refiner", query_refiner_node)
 graph.add_node("duckduckgo_loader", duckduckgo_loader_node)
 graph.add_node("retriever", retriever_node)
+graph.add_node("ranking_agent", ranking_agent_node)
 graph.add_node("generator", generator_node)
 
-graph.set_entry_point("duckduckgo_loader")
+graph.set_entry_point("query_refiner")
+graph.add_edge("query_refiner", "duckduckgo_loader")
 graph.add_edge("duckduckgo_loader", "retriever")
-graph.add_edge("retriever", "generator")
+graph.add_edge("retriever", "ranking_agent")
+graph.add_edge("ranking_agent", "generator")
 graph.set_finish_point("generator")
 
-# Compile Graph
 agentic_rag_pipeline = graph.compile()
-
 
 st.set_page_config(page_title="LLM-REALTOR")
 
